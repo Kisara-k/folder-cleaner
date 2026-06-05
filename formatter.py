@@ -6,7 +6,7 @@ Renders tree lines and summary footer to both stdout and a report file.
 
 import datetime
 import os
-from typing import Optional, TextIO
+from typing import TextIO
 
 from common import MB
 
@@ -48,9 +48,9 @@ class Reporter:
     # Tree rendering
     # ------------------------------------------------------------------
 
-    def root_line(self, path: str, size_bytes: int, file_count: int, cached_at: Optional[float]) -> None:
+    def root_line(self, path: str, size_bytes: int, file_count: int) -> None:
         name = path
-        self._write(_format_line(name, size_bytes, file_count, is_junk=False, cached_at=cached_at, prefix=""))
+        self._write(_format_line(name, size_bytes, file_count, is_junk=False, prefix=""))
 
     def entry_line(
         self,
@@ -60,7 +60,6 @@ class Reporter:
         depth: int,
         is_last: bool,
         is_junk: bool,
-        cached_at: Optional[float],
         prefix_flags: list[bool],  # True = has more siblings at that ancestor level
     ) -> None:
         """
@@ -68,7 +67,7 @@ class Reporter:
         len(prefix_flags) == depth - 1 (ancestors above this entry's parent).
         """
         prefix = _build_prefix(prefix_flags, is_last)
-        self._write(_format_line(name, size_bytes, file_count, is_junk, cached_at, prefix))
+        self._write(_format_line(name, size_bytes, file_count, is_junk, prefix))
 
     def divider(self) -> None:
         self._write("─" * 72)
@@ -81,8 +80,6 @@ class Reporter:
         junk_bytes: int,
         junk_count: int,
         duration: float,
-        cache_hits: int,
-        cache_misses: int,
         report_path: str,
     ) -> None:
         self.divider()
@@ -92,7 +89,6 @@ class Reporter:
         if junk_count > 0:
             self._write(f"Junk size:     {_fmt_mb(junk_bytes)} across {junk_count} junk dir(s)")
         self._write(f"Scan duration: {duration:.2f}s")
-        self._write(f"Cache status:  {cache_hits:,} entries reused, {cache_misses:,} rescanned")
         self._write(f"Report saved:  {report_path}")
 
 
@@ -114,7 +110,6 @@ def _format_line(
     size_bytes: int,
     file_count: int,
     is_junk: bool,
-    cached_at: Optional[float],
     prefix: str,
 ) -> str:
     full_name = prefix + name
@@ -125,9 +120,6 @@ def _format_line(
     flags = ""
     if is_junk:
         flags += "  [JUNK - safe to delete]"
-    if cached_at is not None:
-        dt = datetime.datetime.fromtimestamp(cached_at).strftime("%Y-%m-%d %H:%M")
-        flags += f"  [cached {dt}]"
     return f"{display_name:<{_NAME_WIDTH}}  {size_str}  {count_str}{flags}"
 
 
