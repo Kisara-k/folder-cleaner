@@ -34,7 +34,7 @@ def compute_subtree(args: tuple) -> list[dict]:
     Compute recursive size + file count for a directory subtree.
     Returns a list of result dicts (one per directory encountered).
 
-    args: (root_path, current_mtime, cache_db_path, max_age_hours)
+    args: (root_path, current_mtime, cache_db_path, max_age_hours, force_recompute=False)
     Each result dict:
         {
           "path": str,
@@ -48,7 +48,12 @@ def compute_subtree(args: tuple) -> list[dict]:
     """
     import sqlite3
 
-    root_path, root_mtime, cache_db_path, max_age_hours = args
+    # Handle both old (4-tuple) and new (5-tuple) argument formats for compatibility
+    if len(args) == 4:
+        root_path, root_mtime, cache_db_path, max_age_hours = args
+        force_recompute = False
+    else:
+        root_path, root_mtime, cache_db_path, max_age_hours, force_recompute = args
 
     results: list[dict] = []
 
@@ -113,12 +118,15 @@ def compute_subtree(args: tuple) -> list[dict]:
             "_cached": False,
         })
 
-        cached = _get_cached(conn, path, mtime)
-        if cached is not None:
-            dir_nodes[node_idx]["size_bytes"] = cached[0]
-            dir_nodes[node_idx]["file_count"] = cached[1]
-            dir_nodes[node_idx]["_cached"] = True
-            continue
+        # Skip cache for root if force_recompute is True
+        skip_cache = force_recompute and (path == norm_path(root_path))
+        if not skip_cache:
+            cached = _get_cached(conn, path, mtime)
+            if cached is not None:
+                dir_nodes[node_idx]["size_bytes"] = cached[0]
+                dir_nodes[node_idx]["file_count"] = cached[1]
+                dir_nodes[node_idx]["_cached"] = True
+                continue
 
         if is_junk:
             _shallow_scan(path, dir_nodes[node_idx])
@@ -175,25 +183,138 @@ def compute_subtree(args: tuple) -> list[dict]:
 
 
 def _shallow_scan(path: str, node: dict) -> None:
-    """Scan only one level deep for junk/skip-path dirs."""
+    """
+    Scan junk/skip-path dirs recursively but don't descend for tree expansion.
+    Uses system command for speed: PowerShell on Windows, du on Unix.
+    Falls back to Python traversal if system command fails.
+    """
+    # Try fast system command approach first
+    total_bytes = _get_dir_size_fast(path)
+    if total_bytes >= 0:
+        node["size_bytes"] = total_bytes
+        node["file_count"] = _count_files_recursive(path)
+        return
+
+    # Fallback: full Python traversal (needed if system commands unavailable)
     total_bytes = 0
     total_files = 0
-    try:
-        with os.scandir(path) as it:
-            for entry in it:
-                if entry.is_symlink():
-                    continue
-                try:
-                    st = entry.stat(follow_symlinks=False)
-                except OSError:
-                    continue
-                if entry.is_file(follow_symlinks=False):
-                    total_bytes += st.st_size
-                    total_files += 1
-    except OSError:
-        pass
+    stack = [path]
+    visited = set()
+
+    while stack:
+        current = stack.pop()
+        try:
+            current_st = os.stat(current)
+            visit_key = (getattr(current_st, "st_dev", 0), getattr(current_st, "st_ino", 0))
+            if visit_key in visited:
+                continue
+            visited.add(visit_key)
+        except OSError:
+            continue
+
+        try:
+            with os.scandir(current) as it:
+                for entry in it:
+                    if entry.is_symlink():
+                        continue
+                    try:
+                        st = entry.stat(follow_symlinks=False)
+                    except OSError:
+                        continue
+
+                    if entry.is_file(follow_symlinks=False):
+                        total_bytes += st.st_size
+                        total_files += 1
+                    elif entry.is_dir(follow_symlinks=False):
+                        stack.append(entry.path)
+        except OSError:
+            pass
+
     node["size_bytes"] = total_bytes
     node["file_count"] = total_files
+
+
+def _get_dir_size_fast(path: str) -> int:
+    """
+    Get total directory size using system command.
+    Returns size in bytes, or -1 if system command unavailable/failed.
+    PowerShell on Windows, du on Unix/Linux.
+    """
+    import subprocess
+    import sys
+
+    try:
+        if sys.platform == "win32":
+            # Windows: use PowerShell with proper escaping
+            # Handle empty directories: Measure-Object returns $null, so default to 0
+            ps_cmd = (
+                f"$sum = (Get-ChildItem -Path '{path}' -Recurse -Force -ErrorAction SilentlyContinue | "
+                f"Measure-Object -Property Length -Sum).Sum; "
+                f"if ($null -eq $sum) {{ 0 }} else {{ $sum }}"
+            )
+            result = subprocess.run(
+                ["powershell", "-NoProfile", "-Command", ps_cmd],
+                capture_output=True,
+                text=True,
+                timeout=30
+            )
+            if result.returncode == 0:
+                out = result.stdout.strip()
+                if out:
+                    return int(out)
+        else:
+            # Unix/Linux: use du -sb (non-recursive total size)
+            result = subprocess.run(
+                ["du", "-sb", path],
+                capture_output=True,
+                text=True,
+                timeout=30
+            )
+            if result.returncode == 0:
+                parts = result.stdout.split()
+                if parts:
+                    return int(parts[0])
+    except (subprocess.TimeoutExpired, ValueError, OSError, IndexError):
+        pass
+
+    return -1  # Fallback to Python traversal
+
+
+def _count_files_recursive(path: str) -> int:
+    """Count all files recursively (used with fast size getter)."""
+    count = 0
+    stack = [path]
+    visited = set()
+
+    while stack:
+        current = stack.pop()
+        try:
+            current_st = os.stat(current)
+            visit_key = (getattr(current_st, "st_dev", 0), getattr(current_st, "st_ino", 0))
+            if visit_key in visited:
+                continue
+            visited.add(visit_key)
+        except OSError:
+            continue
+
+        try:
+            with os.scandir(current) as it:
+                for entry in it:
+                    if entry.is_symlink():
+                        continue
+                    try:
+                        entry.stat(follow_symlinks=False)
+                    except OSError:
+                        continue
+
+                    if entry.is_file(follow_symlinks=False):
+                        count += 1
+                    elif entry.is_dir(follow_symlinks=False):
+                        stack.append(entry.path)
+        except OSError:
+            pass
+
+    return count
 
 
 def _node_to_result(node: dict) -> dict:
@@ -218,6 +339,7 @@ def scan_subtree_inprocess(
     skip_paths: frozenset[str],
     cache_db_path: str,
     max_age_hours: float,
+    force_recompute: bool = False,
 ) -> list[dict]:
     """Same as compute_subtree but runs in the calling process."""
     global SKIP_DIRS, SKIP_PATHS
@@ -227,4 +349,4 @@ def scan_subtree_inprocess(
         mtime = os.stat(root_path).st_mtime
     except OSError:
         mtime = 0.0
-    return compute_subtree((root_path, mtime, cache_db_path, max_age_hours))
+    return compute_subtree((root_path, mtime, cache_db_path, max_age_hours, force_recompute))

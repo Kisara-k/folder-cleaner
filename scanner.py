@@ -61,10 +61,11 @@ def _compute_dir_size(
     db_path: str,
     pool: Optional[multiprocessing.Pool],
     depth_remaining: int,
+    force_recompute: bool = False,
 ) -> tuple[int, int, list[dict]]:
     """
     Compute (size_bytes, file_count, children_nodes) for a directory.
-    Uses cache when valid. Falls back to iterative scandir DFS.
+    Uses cache when valid (unless force_recompute=True). Falls back to iterative scandir DFS.
     """
     path = norm_path(path)
 
@@ -75,15 +76,16 @@ def _compute_dir_size(
 
     mtime = st.st_mtime
 
-    cached = db.lookup(path, mtime)
-    if cached is not None:
-        size_bytes, file_count, _ = cached
-        return size_bytes, file_count, []
+    if not force_recompute:
+        cached = db.lookup(path, mtime)
+        if cached is not None:
+            size_bytes, file_count, _ = cached
+            return size_bytes, file_count, []
 
     if pool is not None and depth_remaining > _SUBTREE_WORKER_THRESHOLD:
-        results = _dispatch_to_worker(path, mtime, db_path, pool)
+        results = _dispatch_to_worker(path, mtime, db_path, pool, force_recompute)
     else:
-        results = _scan_dir_iterative(path, db_path)
+        results = _scan_dir_iterative(path, db_path, force_recompute)
 
     for r in results:
         db.store(
@@ -109,9 +111,10 @@ def _dispatch_to_worker(
     mtime: float,
     db_path: str,
     pool: multiprocessing.Pool,
+    force_recompute: bool = False,
 ) -> list[dict]:
     """Send subtree computation to a worker process."""
-    args = (path, mtime, db_path, config.CACHE_MAX_AGE_HOURS)
+    args = (path, mtime, db_path, config.CACHE_MAX_AGE_HOURS, force_recompute)
     try:
         return pool.apply(worker_mod.compute_subtree, (args,))
     except Exception as e:
@@ -121,7 +124,7 @@ def _dispatch_to_worker(
         return worker_mod.compute_subtree(args)
 
 
-def _scan_dir_iterative(root: str, db_path: str) -> list[dict]:
+def _scan_dir_iterative(root: str, db_path: str, force_recompute: bool = False) -> list[dict]:
     """Iterative post-order DFS via worker engine (in-process)."""
     worker_mod.SKIP_DIRS = config.SKIP_DIRS
     worker_mod.SKIP_PATHS = config.SKIP_PATHS
@@ -130,7 +133,7 @@ def _scan_dir_iterative(root: str, db_path: str) -> list[dict]:
     except OSError:
         return []
     return worker_mod.compute_subtree(
-        (root, root_st.st_mtime, db_path, config.CACHE_MAX_AGE_HOURS)
+        (root, root_st.st_mtime, db_path, config.CACHE_MAX_AGE_HOURS, force_recompute)
     )
 
 
@@ -161,7 +164,10 @@ def build_tree(
     inode = get_inode(st)
     is_junk = name in config.SKIP_DIRS or path in config.SKIP_PATHS
 
-    size_bytes, file_count = _get_size_and_count(path, mtime, db, db_path, pool)
+    # Force recompute root if configured (ensures total size accuracy)
+    force_recompute = depth == 0 and config.RECOMPUTE_ROOT
+    is_root = depth == 0
+    size_bytes, file_count = _get_size_and_count(path, mtime, db, db_path, pool, force_recompute, is_root)
     cached_at = db.get_cached_at(path)
 
     children: Optional[list[dict]] = None
@@ -188,12 +194,89 @@ def _get_size_and_count(
     db: cache_mod.CacheDB,
     db_path: str,
     pool: Optional[multiprocessing.Pool],
+    force_recompute: bool = False,
+    is_root: bool = False,
 ) -> tuple[int, int]:
-    cached = db.lookup(path, mtime)
-    if cached is not None:
-        return cached[0], cached[1]
-    size_bytes, file_count, _ = _compute_dir_size(path, db, db_path, pool, config.MAX_DEPTH)
+    if not force_recompute:
+        cached = db.lookup(path, mtime)
+        if cached is not None:
+            return cached[0], cached[1]
+
+    # For root directory with force_recompute, use system command for accuracy
+    if force_recompute and is_root:
+        import subprocess
+        import sys
+
+        try:
+            if sys.platform == "win32":
+                ps_cmd = (
+                    f"$sum = (Get-ChildItem -Path '{path}' -Recurse -Force -ErrorAction SilentlyContinue | "
+                    f"Measure-Object -Property Length -Sum).Sum; "
+                    f"if ($null -eq $sum) {{ 0 }} else {{ $sum }}"
+                )
+                result = subprocess.run(
+                    ["powershell", "-NoProfile", "-Command", ps_cmd],
+                    capture_output=True,
+                    text=True,
+                    timeout=60
+                )
+                if result.returncode == 0:
+                    size_bytes = int(result.stdout.strip() or 0)
+                    # Count files recursively
+                    file_count = _count_files_fast(path)
+                    db.store(path, size_bytes, file_count, mtime, None, True, False)
+                    db.flush()
+                    return size_bytes, file_count
+            else:
+                # Unix/Linux
+                result = subprocess.run(
+                    ["du", "-sb", path],
+                    capture_output=True,
+                    text=True,
+                    timeout=60
+                )
+                if result.returncode == 0:
+                    size_bytes = int(result.stdout.split()[0])
+                    file_count = _count_files_fast(path)
+                    db.store(path, size_bytes, file_count, mtime, None, True, False)
+                    db.flush()
+                    return size_bytes, file_count
+        except Exception:
+            pass  # Fallback to worker
+
+    size_bytes, file_count, _ = _compute_dir_size(path, db, db_path, pool, config.MAX_DEPTH, force_recompute)
     return size_bytes, file_count
+
+
+def _count_files_fast(path: str) -> int:
+    """Count files recursively using system command."""
+    import subprocess
+    import sys
+
+    try:
+        if sys.platform == "win32":
+            ps_cmd = f"(Get-ChildItem -Path '{path}' -Recurse -Force -File -ErrorAction SilentlyContinue | Measure-Object).Count"
+            result = subprocess.run(
+                ["powershell", "-NoProfile", "-Command", ps_cmd],
+                capture_output=True,
+                text=True,
+                timeout=60
+            )
+            if result.returncode == 0:
+                return int(result.stdout.strip() or 0)
+        else:
+            result = subprocess.run(
+                ["find", path, "-type", "f"],
+                capture_output=True,
+                text=True,
+                timeout=60
+            )
+            if result.returncode == 0:
+                return len(result.stdout.strip().split('\n'))
+    except Exception:
+        pass
+
+    return 0
 
 
 def _expand_children(
