@@ -5,7 +5,7 @@ Edit this file, then run: python scanner.py
 
 from common import MB
 
-TARGET_DIR                = r"C:\Users\ASUS\Documents"  # Directory to scan
+TARGET_DIR                = r"D:\Genshin"  # Directory to scan
 MAX_DEPTH                 = 4               # Max levels to display (1 = top-level only)
 INVALIDATE_CACHE          = False           # True = wipe cache and do full rescan
 CACHE_MAX_AGE_HOURS       = 0             # Hours before cache entries auto-expire; 0 = no cache; -1 = never expire
@@ -20,12 +20,13 @@ SKIP_PATHS: frozenset[str] = frozenset({
     r"C:\Windows",
 })
 
-SKIP_DIRS: frozenset[str] = frozenset({
+# Directories that are junk (generated/dependency dirs — safe to delete).
+# Shown with [JUNK - safe to delete]. Automatically included in SKIP_DIRS.
+JUNK_DIRS: frozenset[str] = frozenset({
     "node_modules",
     ".venv",
     "venv",
     "__pycache__",
-    ".git",
     ".next",
     ".pnpm-store",
     ".cache",
@@ -39,3 +40,8 @@ SKIP_DIRS: frozenset[str] = frozenset({
     "Pods",
     ".gradle",
 })
+
+# Additional directories to skip that are NOT junk (don't descend, but safe to keep).
+SKIP_DIRS: frozenset[str] = frozenset({
+    ".git",
+}) | JUNK_DIRS

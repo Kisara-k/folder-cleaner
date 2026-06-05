@@ -162,7 +162,7 @@ def build_tree(
 
     mtime = st.st_mtime
     inode = get_inode(st)
-    is_junk = name in config.SKIP_DIRS or path in config.SKIP_PATHS
+    is_junk = name in config.JUNK_DIRS or path in config.SKIP_PATHS
 
     # Force recompute root if configured (ensures total size accuracy)
     force_recompute = depth == 0 and config.RECOMPUTE_ROOT
