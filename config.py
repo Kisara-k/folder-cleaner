@@ -12,6 +12,12 @@ CACHE_MAX_AGE_HOURS = 24             # Hours before cache entries auto-expire; 0
 MIN_DIR_SIZE_BYTES  = MB             # Don't show children of dirs smaller than this (1 MB)
 NUM_WORKERS         = None           # None = min(cpu_count, 8); or set an int
 
+# Absolute paths to never descend into (shown in report but not expanded).
+# Use this for system directories where SKIP_DIRS name-matching is too broad.
+SKIP_PATHS: frozenset[str] = frozenset({
+    r"C:\Windows",
+})
+
 SKIP_DIRS: frozenset[str] = frozenset({
     "node_modules",
     ".venv",

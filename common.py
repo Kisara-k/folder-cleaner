@@ -18,8 +18,13 @@ def db_file_path() -> str:
 
 
 def norm_path(path: str) -> str:
-    """Normalize to absolute path with no trailing separator."""
-    return os.path.abspath(path).rstrip(os.sep)
+    """Normalize to absolute path with no trailing separator.
+
+    Uses os.path.normpath rather than rstrip(os.sep) so that Windows drive
+    roots like 'C:\\' are preserved correctly — rstrip would collapse 'C:\\'
+    to 'C:', which Windows treats as the CWD on that drive, not the root.
+    """
+    return os.path.normpath(os.path.abspath(path))
 
 
 def get_inode(st) -> int | None:

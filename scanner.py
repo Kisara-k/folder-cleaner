@@ -117,12 +117,14 @@ def _dispatch_to_worker(
     except Exception as e:
         print(f"[WARN] Worker failed for {path}: {e}. Falling back to in-process scan.")
         worker_mod.SKIP_DIRS = config.SKIP_DIRS
+        worker_mod.SKIP_PATHS = config.SKIP_PATHS
         return worker_mod.compute_subtree(args)
 
 
 def _scan_dir_iterative(root: str, db_path: str) -> list[dict]:
     """Iterative post-order DFS via worker engine (in-process)."""
     worker_mod.SKIP_DIRS = config.SKIP_DIRS
+    worker_mod.SKIP_PATHS = config.SKIP_PATHS
     try:
         root_st = os.stat(root)
     except OSError:
@@ -157,7 +159,7 @@ def build_tree(
 
     mtime = st.st_mtime
     inode = get_inode(st)
-    is_junk = name in config.SKIP_DIRS
+    is_junk = name in config.SKIP_DIRS or path in config.SKIP_PATHS
 
     size_bytes, file_count = _get_size_and_count(path, mtime, db, db_path, pool)
     cached_at = db.get_cached_at(path)
@@ -205,8 +207,8 @@ def _expand_children(
     try:
         with os.scandir(path) as it:
             entries = list(it)
-    except PermissionError:
-        print(f"[WARN] Permission denied: {path}")
+    except OSError as e:
+        print(f"[WARN] Cannot scan {path}: {e}")
         return []
 
     file_nodes: list[dict] = []
@@ -326,7 +328,7 @@ def main() -> None:
         pool = multiprocessing.Pool(
             processes=n_workers,
             initializer=worker_mod._pool_init,
-            initargs=(config.SKIP_DIRS,),
+            initargs=(config.SKIP_DIRS, config.SKIP_PATHS),
         )
 
     try:

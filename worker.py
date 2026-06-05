@@ -11,16 +11,18 @@ from typing import Optional
 
 from common import get_inode, is_cache_fresh, norm_path, open_db_connection
 
-SKIP_DIRS: frozenset[str] = frozenset()  # Set by _pool_init or scan_subtree_inprocess
+SKIP_DIRS: frozenset[str] = frozenset()   # directory names to shallow-scan (set by _pool_init)
+SKIP_PATHS: frozenset[str] = frozenset()  # absolute paths to shallow-scan (set by _pool_init)
 
 
 # ------------------------------------------------------------------
 # Worker initializer — called once per process in the Pool
 # ------------------------------------------------------------------
 
-def _pool_init(skip_dirs: frozenset[str]) -> None:
-    global SKIP_DIRS
+def _pool_init(skip_dirs: frozenset[str], skip_paths: frozenset[str]) -> None:
+    global SKIP_DIRS, SKIP_PATHS
     SKIP_DIRS = skip_dirs
+    SKIP_PATHS = skip_paths
 
 
 # ------------------------------------------------------------------
@@ -64,13 +66,38 @@ def compute_subtree(args: tuple) -> list[dict]:
 
     conn = open_db_connection(cache_db_path)
 
-    # Phase 1: collect all directories via iterative DFS (top-down)
-    dir_stack: list[tuple[str, float, Optional[int], bool]] = [(root_path, root_mtime, None, False)]
+    # Seed root stat for junction guard
+    try:
+        root_st = os.stat(root_path)
+        root_inode = get_inode(root_st)
+        root_dev = getattr(root_st, "st_dev", 0)
+    except OSError:
+        root_inode = None
+        root_dev = 0
+
+    # visited tracks (st_dev, inode) to detect NTFS junction cycles.
+    # Falls back to norm_path when inode is unavailable (st_ino == 0).
+    visited: set = set()
+
+    # Stack entries: (path, mtime, inode, st_dev, is_junk)
+    dir_stack: list[tuple[str, float, Optional[int], int, bool]] = [
+        (root_path, root_mtime, root_inode, root_dev, False)
+    ]
     dir_nodes: list[dict] = []
 
     while dir_stack:
-        path, mtime, inode, is_junk = dir_stack.pop()
+        path, mtime, inode, st_dev, is_junk = dir_stack.pop()
         path = norm_path(path)
+
+        # Junction / hard-link cycle guard
+        visit_key = (st_dev, inode) if inode else path
+        if visit_key in visited:
+            continue
+        visited.add(visit_key)
+
+        # SKIP_PATHS: treat matched absolute paths like junk (shallow scan only)
+        if path in SKIP_PATHS:
+            is_junk = True
 
         node_idx = len(dir_nodes)
         dir_nodes.append({
@@ -112,11 +139,17 @@ def compute_subtree(args: tuple) -> list[dict]:
                         dir_nodes[node_idx]["direct_file_count"] += 1
                     elif entry.is_dir(follow_symlinks=False):
                         child_path = norm_path(entry.path)
-                        child_is_junk = entry.name in SKIP_DIRS
+                        child_is_junk = entry.name in SKIP_DIRS or child_path in SKIP_PATHS
                         child_idx = len(dir_nodes)
                         dir_nodes[node_idx]["child_indices"].append(child_idx)
-                        dir_stack.append((child_path, st.st_mtime, get_inode(st), child_is_junk))
-        except PermissionError:
+                        dir_stack.append((
+                            child_path,
+                            st.st_mtime,
+                            get_inode(st),
+                            getattr(st, "st_dev", 0),
+                            child_is_junk,
+                        ))
+        except OSError:
             pass
 
     # Phase 2: bottom-up aggregation (reverse DFS order)
@@ -142,7 +175,7 @@ def compute_subtree(args: tuple) -> list[dict]:
 
 
 def _shallow_scan(path: str, node: dict) -> None:
-    """Scan only one level deep for junk dirs."""
+    """Scan only one level deep for junk/skip-path dirs."""
     total_bytes = 0
     total_files = 0
     try:
@@ -157,7 +190,7 @@ def _shallow_scan(path: str, node: dict) -> None:
                 if entry.is_file(follow_symlinks=False):
                     total_bytes += st.st_size
                     total_files += 1
-    except PermissionError:
+    except OSError:
         pass
     node["size_bytes"] = total_bytes
     node["file_count"] = total_files
@@ -182,12 +215,14 @@ def _node_to_result(node: dict) -> dict:
 def scan_subtree_inprocess(
     root_path: str,
     skip_dirs: frozenset[str],
+    skip_paths: frozenset[str],
     cache_db_path: str,
     max_age_hours: float,
 ) -> list[dict]:
     """Same as compute_subtree but runs in the calling process."""
-    global SKIP_DIRS
+    global SKIP_DIRS, SKIP_PATHS
     SKIP_DIRS = skip_dirs
+    SKIP_PATHS = skip_paths
     try:
         mtime = os.stat(root_path).st_mtime
     except OSError:
