@@ -159,7 +159,9 @@ class CacheDB:
         self._conn.commit()
 
     def get_cached_at(self, path: str) -> Optional[float]:
-        """Return cached_at timestamp for a path, or None."""
+        """Return cached_at timestamp for a path, or None if cache is disabled."""
+        if self._max_age_hours == 0:
+            return None
         path = norm_path(path)
         row = self._conn.execute(
             "SELECT cached_at FROM dir_cache WHERE path=?", (path,)

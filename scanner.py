@@ -306,6 +306,8 @@ def _expand_children(
             continue
 
         if entry.is_file(follow_symlinks=False):
+            if st.st_size < config.MIN_FILE_SIZE_BYTES:
+                continue
             file_nodes.append(_make_node(
                 path=norm_path(entry.path),
                 name=entry.name,
