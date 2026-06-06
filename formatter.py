@@ -50,7 +50,7 @@ class Reporter:
 
     def root_line(self, path: str, size_bytes: int, file_count: int, cached_at: Optional[float]) -> None:
         name = path
-        self._write(_format_line(name, size_bytes, file_count, is_junk=False, cached_at=cached_at, prefix=""))
+        self._write(_format_line(name, size_bytes, file_count, is_junk=False, cached_at=cached_at, prefix="", dotted=False))
 
     def entry_line(
         self,
@@ -68,7 +68,7 @@ class Reporter:
         len(prefix_flags) == depth - 1 (ancestors above this entry's parent).
         """
         prefix = _build_prefix(prefix_flags, is_last)
-        self._write(_format_line(name, size_bytes, file_count, is_junk, cached_at, prefix))
+        self._write(_format_line(name, size_bytes, file_count, is_junk, cached_at, prefix, dotted=depth % 2 == 0))
 
     def divider(self) -> None:
         self._write("─" * 72)
@@ -116,10 +116,18 @@ def _format_line(
     is_junk: bool,
     cached_at: Optional[float],
     prefix: str,
+    dotted: bool = False,
 ) -> str:
     full_name = prefix + name
     # Truncate name if too long
     display_name = full_name if len(full_name) <= _NAME_WIDTH else full_name[: _NAME_WIDTH - 3] + "..."
+    pad_len = _NAME_WIDTH - len(display_name)
+    if dotted and pad_len >= 3:
+        # Dot leader: " · · · · ·" filling the remaining name column width
+        dot_pairs = (pad_len - 1) // 2
+        padding = (" · " * dot_pairs + " ")[:pad_len]
+    else:
+        padding = " " * pad_len
     size_str = _fmt_mb(size_bytes).rjust(_SIZE_WIDTH)
     count_str = f"{file_count:,} files".rjust(_COUNT_WIDTH)
     flags = ""
@@ -128,7 +136,7 @@ def _format_line(
     if cached_at is not None:
         dt = datetime.datetime.fromtimestamp(cached_at).strftime("%Y-%m-%d %H:%M")
         flags += f"  [cached {dt}]"
-    return f"{display_name:<{_NAME_WIDTH}}  {size_str}  {count_str}{flags}"
+    return f"{display_name}{padding}  {size_str}  {count_str}{flags}"
 
 
 def _fmt_mb(size_bytes: int) -> str:
