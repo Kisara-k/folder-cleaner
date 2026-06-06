@@ -387,25 +387,70 @@ def render_tree(
 # Entry point
 # ------------------------------------------------------------------------------
 
+def _scan_target(
+    target: str,
+    db: cache_mod.CacheDB,
+    db_path: str,
+    pool: Optional[multiprocessing.Pool],
+) -> None:
+    """Run a single directory scan and write its report."""
+    report_path = fmt_mod.make_report_path(target)
+    start = time.perf_counter()
+
+    root_node = build_tree(target, db, db_path, pool, depth=0)
+
+    reporter = fmt_mod.Reporter(report_path)
+    reporter.open()
+
+    stats = {"total_bytes": 0, "total_files": 0, "junk_bytes": 0, "junk_count": 0}
+    render_tree(root_node, reporter, prefix_flags=[], depth=0, is_last=True, stats=stats)
+
+    elapsed = time.perf_counter() - start
+
+    db.update_meta("last_full_scan_time", str(time.time()))
+    db.update_meta("scan_root", target)
+
+    reporter.summary(
+        root=target,
+        total_bytes=stats["total_bytes"],
+        total_files=stats["total_files"],
+        junk_bytes=stats["junk_bytes"],
+        junk_count=stats["junk_count"],
+        duration=elapsed,
+        cache_hits=db.hits,
+        cache_misses=db.misses,
+        report_path=report_path,
+    )
+    reporter.close()
+
+
 def main() -> None:
-    target = norm_path(config.TARGET_DIR)
-    if not os.path.isdir(target):
-        print(f"[ERROR] Target directory not found: {target}")
-        sys.exit(1)
+    # Deduplicate and sort: shallower (parent) directories come first so that
+    # a parent's scan populates the cache before any child scan runs.
+    targets: list[str] = sorted(
+        {norm_path(d) for d in config.TARGET_DIRS},
+        key=lambda p: (p.count(os.sep), p),
+    )
+
+    for target in targets:
+        if not os.path.isdir(target):
+            print(f"[ERROR] Target directory not found: {target}")
+            sys.exit(1)
 
     db_path = db_file_path()
-    report_path = fmt_mod.make_report_path(target)
+    n = len(targets)
 
-    print(f"Folder Analyzer — scanning: {target}")
+    print(f"Folder Analyzer — scanning {n} director{'y' if n == 1 else 'ies'}")
     print(f"Max depth: {config.MAX_DEPTH}  |  Cache: {'INVALIDATED' if config.INVALIDATE_CACHE else 'enabled'}")
     print()
-
-    start = time.perf_counter()
 
     db = cache_mod.open_cache(
         invalidate=config.INVALIDATE_CACHE,
         max_age_hours=config.CACHE_MAX_AGE_HOURS,
     )
+    # Snapshot cache state before any scan so that intra-run cache entries
+    # written by a parent's scan are not reported as "reused" in a child's report.
+    db.set_pre_run_snapshot()
 
     n_workers = config.NUM_WORKERS if config.NUM_WORKERS is not None else min(os.cpu_count() or 1, 8)
     pool: Optional[multiprocessing.Pool] = None
@@ -417,32 +462,14 @@ def main() -> None:
         )
 
     try:
-        root_node = build_tree(target, db, db_path, pool, depth=0)
-
-        reporter = fmt_mod.Reporter(report_path)
-        reporter.open()
-
-        stats = {"total_bytes": 0, "total_files": 0, "junk_bytes": 0, "junk_count": 0}
-        render_tree(root_node, reporter, prefix_flags=[], depth=0, is_last=True, stats=stats)
-
-        elapsed = time.perf_counter() - start
-
-        db.update_meta("last_full_scan_time", str(time.time()))
-        db.update_meta("scan_root", target)
-
-        reporter.summary(
-            root=target,
-            total_bytes=stats["total_bytes"],
-            total_files=stats["total_files"],
-            junk_bytes=stats["junk_bytes"],
-            junk_count=stats["junk_count"],
-            duration=elapsed,
-            cache_hits=db.hits,
-            cache_misses=db.misses,
-            report_path=report_path,
-        )
-        reporter.close()
-
+        for i, target in enumerate(targets):
+            if n > 1:
+                print(f"[{i + 1}/{n}] Scanning: {target}")
+                print()
+            db.reset_scan_counters()
+            _scan_target(target, db, db_path, pool)
+            if n > 1 and i < n - 1:
+                print()
     finally:
         if pool is not None:
             pool.close()

@@ -95,11 +95,27 @@ class CacheDB:
         self._hits = 0
         self._misses = 0
         self._batch: list[tuple] = []
+        self._pre_run_paths: set[str] = set()
         self._BATCH_SIZE = 500
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
+
+    def set_pre_run_snapshot(self) -> None:
+        """Record which paths are cached right now, before any scans in this run.
+
+        Only entries present in this snapshot will be counted as cache hits.
+        Entries written by an earlier target's scan in the same run are treated
+        as fresh computes, so child-dir reports don't falsely claim cache reuse.
+        """
+        rows = self._conn.execute("SELECT path FROM dir_cache").fetchall()
+        self._pre_run_paths = {r[0] for r in rows}
+
+    def reset_scan_counters(self) -> None:
+        """Reset hit/miss counters before scanning each target directory."""
+        self._hits = 0
+        self._misses = 0
 
     def lookup(
         self,
@@ -121,7 +137,13 @@ class CacheDB:
         if not is_cache_fresh(cached_mtime, current_mtime, cached_at, self._max_age_hours):
             self._misses += 1
             return None
-        self._hits += 1
+        # Only count as a hit if this entry existed before the current run started.
+        # Entries populated by an earlier target's scan this session are "fresh
+        # computes" from the user's perspective, not reused past-cache.
+        if path in self._pre_run_paths:
+            self._hits += 1
+        else:
+            self._misses += 1
         return (size_bytes, file_count, bool(is_junk))
 
     def store(
